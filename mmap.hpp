@@ -228,14 +228,18 @@ class MmapFile final {
   /// the replacement mapping is prepared before the file is truncated so an
   /// mmap failure leaves the original mapping and file unchanged. The operation
   /// is not transactional against external writers; use LockMode::exclusive
-  /// when all file users cooperate.
+  /// when all file users cooperate. A failed shrink may leave a valid smaller
+  /// mapping over the unchanged larger file; remap() restores an automatically
+  /// sized mapping to the current extent.
   void resize(file_offset new_size);
 
   /// Recreates the mapping for the backing file's current size without
   /// changing that size. This is the explicit recovery operation after a
   /// detected external size change or a failed growth operation. Existing
   /// spans become invalid after a successful call. It cannot make an mmap
-  /// safe against concurrent, non-cooperating truncation.
+  /// safe against concurrent, non-cooperating truncation. Writable private
+  /// mappings reject this operation because remapping would silently discard
+  /// their copy-on-write modifications.
   void remap();
 
   /// Requests synchronous writeback of modified shared-mapping pages.

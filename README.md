@@ -277,12 +277,19 @@ These are advisory locks: every process that can change the file must use the
 same protocol. They cannot make an mmap safe against unrelated or malicious
 external truncation.
 
+Structural operations (`resize()`, `insert()`, and `append()`) are rejected
+when the object holds `LockMode::shared`; use `LockMode::exclusive` for a
+cooperatively locked writer. `LockMode::none` remains available when ownership
+is enforced outside this library.
+
 For automatically sized mappings (`Config::length == 0`), `insert()`,
 `append()`, and `resize()` verify that the backing-file size still matches the
 mapped extent before changing data. If another process has changed the size,
 they throw rather than overwrite at a stale offset. After coordinating with
 that process, call `remap()` to recreate the mapping for the current file size;
-this invalidates all existing spans.
+this invalidates all existing spans. Writable private mappings reject
+`remap()` because recreating a `MAP_PRIVATE` mapping would discard uncommitted
+copy-on-write modifications.
 
 ### Growth, persistence, and throughput
 

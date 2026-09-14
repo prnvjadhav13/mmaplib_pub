@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -218,6 +219,38 @@ void advisory_locks_reject_conflicting_cooperating_openers() {
   check(reader.is_open(), "advisory lock was not released on close");
 }
 
+void shared_locks_reject_structural_modification() {
+  TemporaryPath temporary("shared-lock-mutation");
+  write_file(temporary.path(), "abcdef");
+  mmaplib::Config config;
+  config.access = mmaplib::Access::read_write;
+  config.sharing = mmaplib::Sharing::shared;
+  config.locking = mmaplib::LockMode::shared;
+  mmaplib::MmapFile file(temporary.path(), config);
+
+  expect_throw<std::logic_error>([&] { file.resize(3); },
+                                 "shared lock allowed resize");
+  expect_throw<std::logic_error>([&] { file.insert("x", 1); },
+                                 "shared lock allowed insert");
+  check(file.file_size() == 6, "shared-lock mutation changed file size");
+}
+
+void invalid_length_is_rejected_before_truncation() {
+  TemporaryPath temporary("validate-before-truncate");
+  write_file(temporary.path(), "preserve me");
+  mmaplib::Config config;
+  config.access = mmaplib::Access::read_write;
+  config.truncate_existing = true;
+  config.length = std::numeric_limits<std::size_t>::max();
+
+  expect_throw<std::length_error>(
+      [&] { mmaplib::MmapFile invalid(temporary.path(), config); },
+      "overflowing mapping length was accepted");
+  std::ifstream input(temporary.path(), std::ios::binary);
+  std::string contents((std::istreambuf_iterator<char>(input)), {});
+  check(contents == "preserve me", "invalid configuration truncated the file");
+}
+
 void external_growth_requires_remap_before_append() {
   TemporaryPath temporary("external-growth");
   write_file(temporary.path(), "abc");
@@ -345,6 +378,24 @@ void private_growth_and_dont_need_are_rejected_without_data_loss() {
         "private modification was lost");
 }
 
+void private_writable_remap_is_rejected_without_data_loss() {
+  TemporaryPath temporary("private-remap");
+  write_file(temporary.path(), "abcdef");
+  mmaplib::Config config;
+  config.access = mmaplib::Access::read_write;
+  mmaplib::MmapFile file(temporary.path(), config);
+  file.write("X", 0);
+
+  std::ofstream external(temporary.path(), std::ios::binary | std::ios::app);
+  external << 'G';
+  external.close();
+
+  expect_throw<std::logic_error>([&] { file.remap(); },
+                                 "private writable remap was accepted");
+  check(static_cast<char>(file.bytes()[0]) == 'X',
+        "rejected private remap discarded a private modification");
+}
+
 void invalid_resize_never_truncates_file() {
   TemporaryPath temporary("resize-offset");
   const long page_size = ::sysconf(_SC_PAGESIZE);
@@ -412,6 +463,8 @@ int main() {
   empty_mapping_operations_are_safe();
   invalid_configurations_are_rejected();
   advisory_locks_reject_conflicting_cooperating_openers();
+  shared_locks_reject_structural_modification();
+  invalid_length_is_rejected_before_truncation();
   external_growth_requires_remap_before_append();
   close_is_idempotent();
   access_and_length_restrictions_are_enforced();
@@ -419,6 +472,7 @@ int main() {
   private_changes_do_not_persist();
   const_read_only_views_and_overlapping_copies_are_safe();
   private_growth_and_dont_need_are_rejected_without_data_loss();
+  private_writable_remap_is_rejected_without_data_loss();
   invalid_resize_never_truncates_file();
   move_assignment_releases_previous_mapping();
 
