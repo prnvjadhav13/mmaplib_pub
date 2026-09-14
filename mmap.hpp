@@ -29,6 +29,17 @@ enum class Sharing {
   shared
 };
 
+/// Optional advisory lock held for the lifetime of an open MmapFile.
+///
+/// Locks coordinate only with processes which request compatible locks. They
+/// cannot protect a mapping from an unrelated process that truncates or
+/// replaces the backing file.
+enum class LockMode {
+  none,
+  shared,
+  exclusive
+};
+
 /// Origin used when changing the file descriptor's current position with
 /// seek().
 enum class SeekWhence {
@@ -65,6 +76,12 @@ struct Config {
   /// use copy-on-write.
   Sharing sharing{Sharing::private_copy};
 
+  /// Optional non-blocking advisory lock acquired when the file is opened.
+  /// A conflicting lock makes construction throw std::system_error. Use
+  /// exclusive when this process owns resize or truncate operations; every
+  /// cooperating process must also request a compatible lock.
+  LockMode locking{LockMode::none};
+
   /// If true, create the file when it does not already exist. Requires
   /// read-write access.
   bool create_if_missing{false};
@@ -91,9 +108,10 @@ struct Config {
 class MmapFile final {
  public:
   /// Opens path and creates its mapping according to config.
-  /// Throws std::system_error for operating-system failures and
-  /// std::invalid_argument for invalid options. The mapping is released
-  /// automatically when the object is destroyed.
+  /// Throws std::system_error for operating-system failures (including a
+  /// conflicting requested advisory lock) and std::invalid_argument for
+  /// invalid options. The mapping is released automatically when the object
+  /// is destroyed.
   explicit MmapFile(const std::filesystem::path& path, Config config = {});
 
   /// Releases the mapping and underlying file resource. Never throws.
@@ -108,8 +126,8 @@ class MmapFile final {
   MmapFile& operator=(MmapFile&& other) noexcept;
 
   /// Explicitly releases the mapping and file resource. Safe to call more than
-  /// once. Throws std::system_error if unmapping fails. Close errors for
-  /// regular files are ignored.
+  /// once. Throws std::system_error if unmapping fails on the first close.
+  /// Close errors for regular files are ignored.
   void close();
 
   /// Returns true while the file and its mapping are owned by this object.
@@ -132,7 +150,9 @@ class MmapFile final {
 
   /// Returns a read-only zero-copy view of the mapped bytes.
   /// The returned span is valid only while this object remains open and the
-  /// mapped region is unchanged.
+  /// mapped region is unchanged. Access to the span must be externally
+  /// synchronized with close(), resize(), insert(), append(), move-assignment,
+  /// and destruction.
   [[nodiscard]] std::span<const std::byte> bytes() const noexcept;
 
   /// Returns a writable zero-copy view of the mapped bytes.
@@ -204,10 +224,19 @@ class MmapFile final {
   /// resulting range. Existing spans become invalid after this call and must
   /// not be used. Growth is supported only for shared writable mappings;
   /// private mappings retain copy-on-write pages. Throws std::invalid_argument,
-  /// std::logic_error, or std::system_error on failure. After a successful file
-  /// resize followed by a mapping failure, the object can remain open without
-  /// an active mapping.
+  /// std::logic_error, or std::system_error on failure. For shrink operations,
+  /// the replacement mapping is prepared before the file is truncated so an
+  /// mmap failure leaves the original mapping and file unchanged. The operation
+  /// is not transactional against external writers; use LockMode::exclusive
+  /// when all file users cooperate.
   void resize(file_offset new_size);
+
+  /// Recreates the mapping for the backing file's current size without
+  /// changing that size. This is the explicit recovery operation after a
+  /// detected external size change or a failed growth operation. Existing
+  /// spans become invalid after a successful call. It cannot make an mmap
+  /// safe against concurrent, non-cooperating truncation.
+  void remap();
 
   /// Requests synchronous writeback of modified shared-mapping pages.
   /// Throws std::logic_error for private copy-on-write mappings.

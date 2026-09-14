@@ -8,7 +8,7 @@ The public API is defined in `mmap.hpp` and uses the `mmaplib` namespace.
 
 - RAII ownership of the file and memory mapping
 - Move-only `MmapFile` objects
-- Zero-copy access through `bytes()` and `view()`
+- Zero-copy read access through `bytes()` and `view()`, with explicit writable views through `mutable_bytes()` and `mutable_view()`
 - Optional copying helpers through `read()` and `write()`
 - Insertion of text or binary data at any valid mapping position
 - Appending text or binary data at the end of the mapped file
@@ -42,7 +42,7 @@ CMakeLists.txt           Library and test build configuration
 From this directory:
 
 ```bash
-cmake -S . -B build -DBUILD_TESTING=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build --parallel
 ```
 
@@ -154,7 +154,7 @@ int main() {
 
     mmaplib::MmapFile file(path, config);
 
-    auto mapped = file.view(0, file.mapping_length());
+    auto mapped = file.mutable_view(0, file.mapping_length());
     if (!mapped.empty()) {
         mapped[0] = std::byte{'H'};
     }
@@ -249,6 +249,8 @@ g++ -std=c++20 \
 
 `bytes()` and `view()` return `std::span` objects pointing directly into the operating-system mapping. They do not copy file contents.
 
+Use `mutable_bytes()` or `mutable_view()` for direct writable access. The separate names prevent a non-const read-only `MmapFile` from accidentally selecting a writable API.
+
 Do not keep a span after:
 
 - `MmapFile::close()`
@@ -257,6 +259,38 @@ Do not keep a span after:
 - Destruction of the owning `MmapFile`
 
 A span can also become invalid if another process truncates or otherwise changes the mapped file externally.
+
+### Concurrency and process coordination
+
+`MmapFile` does not provide synchronization for bytes accessed through returned spans. Callers must ensure that no thread accesses a span while another thread calls `close()`, `resize()`, `insert()`, `append()`, move-assignment, or destruction on the same object. Concurrent writes to the same bytes require application-level synchronization. Other processes must not truncate or replace an actively mapped file: Linux can raise `SIGBUS` for that case, which cannot be converted into a normal C++ range-check error.
+
+For cooperating processes, request an advisory lock when opening the file:
+
+```cpp
+config.locking = mmaplib::LockMode::exclusive;
+```
+
+`LockMode::exclusive` is appropriate for a process that resizes or truncates
+the file; readers can use `LockMode::shared`. Lock acquisition is non-blocking
+and a conflicting lock causes construction to throw `std::system_error`.
+These are advisory locks: every process that can change the file must use the
+same protocol. They cannot make an mmap safe against unrelated or malicious
+external truncation.
+
+For automatically sized mappings (`Config::length == 0`), `insert()`,
+`append()`, and `resize()` verify that the backing-file size still matches the
+mapped extent before changing data. If another process has changed the size,
+they throw rather than overwrite at a stale offset. After coordinating with
+that process, call `remap()` to recreate the mapping for the current file size;
+this invalidates all existing spans.
+
+### Growth, persistence, and throughput
+
+`resize()`, `insert()`, and `append()` are supported only for writable shared mappings. They are rejected for private copy-on-write mappings because remapping would otherwise silently discard private dirty pages. `insert()` and `append()` remap and invalidate all spans; use a pre-sized shared mapping and write records directly through `mutable_view()` for sustained low-latency writes.
+
+`sync()` flushes the complete mapping. `sync_range(position, count)` flushes a smaller dirty range; its position must be page aligned. A successful `sync()` requests synchronous mapped-page writeback but does not make multiple writes atomic or supply a crash-recovery protocol. For durable data formats, use record framing/checksums and a commit/recovery design appropriate to the application.
+
+`Advice::will_need` and `Config::prefault` can reduce first-touch faults at the cost of open latency and RAM pressure; they do not guarantee resident pages or bounded latency. `Advice::dont_need` is rejected for writable private mappings because Linux may discard their copy-on-write changes. Benchmark warm and cold cache behavior, random and sequential access, memory pressure, and p99 latency on the target storage before setting production SLOs.
 
 ### Shared versus private mappings
 

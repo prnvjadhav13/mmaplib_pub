@@ -11,7 +11,6 @@
 #include <string_view>
 #include <utility>
 #include <cstring>
-#include <iomanip>
 
 namespace {
 
@@ -189,6 +188,69 @@ void invalid_configurations_are_rejected() {
       "read-only truncate configuration was accepted");
 }
 
+void advisory_locks_reject_conflicting_cooperating_openers() {
+  TemporaryPath temporary("advisory-lock");
+  write_file(temporary.path(), "data");
+
+  mmaplib::Config exclusive;
+  exclusive.locking = mmaplib::LockMode::exclusive;
+  mmaplib::MmapFile owner(temporary.path(), exclusive);
+
+  mmaplib::Config shared;
+  shared.locking = mmaplib::LockMode::shared;
+  expect_throw<std::system_error>(
+      [&] { mmaplib::MmapFile blocked(temporary.path(), shared); },
+      "conflicting advisory lock was accepted");
+
+  mmaplib::Config blocked_truncate;
+  blocked_truncate.access = mmaplib::Access::read_write;
+  blocked_truncate.truncate_existing = true;
+  blocked_truncate.locking = mmaplib::LockMode::exclusive;
+  expect_throw<std::system_error>(
+      [&] { mmaplib::MmapFile blocked(temporary.path(), blocked_truncate); },
+      "conflicting lock allowed truncation");
+  check(std::string(reinterpret_cast<const char*>(owner.bytes().data()),
+                    owner.bytes().size()) == "data",
+        "failed lock acquisition truncated the backing file");
+
+  owner.close();
+  mmaplib::MmapFile reader(temporary.path(), shared);
+  check(reader.is_open(), "advisory lock was not released on close");
+}
+
+void external_growth_requires_remap_before_append() {
+  TemporaryPath temporary("external-growth");
+  write_file(temporary.path(), "abc");
+  mmaplib::Config config;
+  config.access = mmaplib::Access::read_write;
+  config.sharing = mmaplib::Sharing::shared;
+  mmaplib::MmapFile file(temporary.path(), config);
+
+  std::ofstream external(temporary.path(), std::ios::binary | std::ios::app);
+  external << "EXT";
+  external.close();
+
+  expect_throw<std::logic_error>([&] { file.append("Y"); },
+                                 "append accepted external file growth");
+  file.remap();
+  file.append("Y");
+  file.sync();
+  file.close();
+
+  std::ifstream input(temporary.path(), std::ios::binary);
+  std::string contents((std::istreambuf_iterator<char>(input)), {});
+  check(contents == "abcEXTY", "remapped append corrupted external data");
+}
+
+void close_is_idempotent() {
+  TemporaryPath temporary("idempotent-close");
+  write_file(temporary.path(), "data");
+  mmaplib::MmapFile file(temporary.path());
+  file.close();
+  file.close();
+  check(!file.is_open(), "closed file reports itself as open");
+}
+
 void access_and_length_restrictions_are_enforced() {
   TemporaryPath temporary("restrictions");
   write_file(temporary.path(), "fixed data");
@@ -316,69 +378,28 @@ void move_assignment_releases_previous_mapping() {
                                  "move-assigned source was usable");
 }
 
-void print_hex_dump(std::span<const std::byte> data) {
-  for (std::size_t index = 0; index < data.size(); ++index) {
-    const auto value = std::to_integer<unsigned int>(data[index]);
+void same_length_text_replacement_is_safe() {
+  TemporaryPath temporary("text-replacement");
+  write_file(temporary.path(), "old value");
+  mmaplib::Config config;
+  config.access = mmaplib::Access::read_write;
+  config.sharing = mmaplib::Sharing::shared;
+  mmaplib::MmapFile file(temporary.path(), config);
 
-    std::cout << std::hex << std::setw(2) << std::setfill('0') << value << ' ';
+  auto mapped = file.mutable_bytes();
+  std::string_view text(reinterpret_cast<const char*>(mapped.data()),
+                        mapped.size());
+  constexpr std::string_view from{"old"};
+  constexpr std::string_view to{"new"};
+  const std::size_t position = text.find(from);
+  check(position != std::string_view::npos, "replacement source was not found");
+  std::memcpy(mapped.data() + position, to.data(), to.size());
+  file.sync();
+  file.close();
 
-    // Start a new line every 16 bytes.
-    if ((index + 1) % 16 == 0) {
-      std::cout << '\n';
-    }
-  }
-
-  if (data.size() % 16 != 0) {
-    std::cout << '\n';
-  }
-
-  std::cout << std::dec;  // Restore normal decimal output.
-}
-
-void my_test() {
-  const std::filesystem::path path =
-      "/tmp/linuxfs-mmap-test.bin";
-
-  try {
-    mmaplib::Config config;
-    config.access = mmaplib::Access::read_write;
-    config.sharing = mmaplib::Sharing::shared;
-    config.offset = 0;
-    mmaplib::MmapFile server_map(path, config);
-    const auto data = server_map.bytes();
-    auto mutable_data = server_map.mutable_view(0, server_map.mapping_length());
-
-    if (data.size() < 3) {
-      throw std::runtime_error("mapping contains fewer than 3 bytes");
-    }
-
-    const char* text =
-    reinterpret_cast<const char*>(data.data());
-    
-    std::cout << "this is a string = ";
-    std::cout.write(text, static_cast<std::streamsize>(data.size()));
-    std::cout << '\n';
-
-    //mutable_data.repl
-    std::string_view stext(reinterpret_cast<const char*>(mutable_data.data()), mutable_data.size());
-    std::string_view from = "My era";
-    std::string_view to   = "Coolra";
-
-    auto pos = stext.find(from);
-    if (pos != std::string_view::npos) {
-        if (to.size() != from.size()) {
-            throw std::runtime_error("in-place mmap replacement must be same length");
-        }
-
-        std::memcpy(mutable_data.data() + pos, to.data(), to.size());
-    }
-
-    //print_hex_dump(data.first(std::min<std::size_t>(64, data.size())));
-  } catch (const std::system_error& error) {
-    std::cerr << "mmap failed: " << error.what() << '\n';
-  } catch (const std::exception& error) {
-    std::cerr << "test failed: " << error.what() << '\n';
-  }
+  std::ifstream input(temporary.path(), std::ios::binary);
+  std::string contents((std::istreambuf_iterator<char>(input)), {});
+  check(contents == "new value", "same-length replacement did not persist");
 }
 
 }  // namespace
@@ -390,6 +411,9 @@ int main() {
   moved_from_operations_throw();
   empty_mapping_operations_are_safe();
   invalid_configurations_are_rejected();
+  advisory_locks_reject_conflicting_cooperating_openers();
+  external_growth_requires_remap_before_append();
+  close_is_idempotent();
   access_and_length_restrictions_are_enforced();
   aligned_offsets_and_prefault_remapping_work();
   private_changes_do_not_persist();
@@ -398,6 +422,6 @@ int main() {
   invalid_resize_never_truncates_file();
   move_assignment_releases_previous_mapping();
 
-  my_test();
+  same_length_text_replacement_is_safe();
   std::cout << "mmap tests passed\n";
 }

@@ -82,6 +82,9 @@ file_offset MmapFile::seek(file_offset, SeekWhence) const {
 void MmapFile::resize(file_offset) {
   unsupported();
 }
+void MmapFile::remap() {
+  unsupported();
+}
 void MmapFile::sync(bool) {
   unsupported();
 }

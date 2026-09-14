@@ -3,7 +3,7 @@ AR ?= ar
 INSTALL ?= install
 PREFIX ?= /usr/local
 
-CXXFLAGS ?= -std=c++20 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+CXXFLAGS ?= -std=c++20 -O3 -DNDEBUG -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 CPPFLAGS ?= -I.
 ARFLAGS ?= rcs
 

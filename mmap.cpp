@@ -1,6 +1,7 @@
 #include "mmap.hpp"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -29,9 +30,6 @@ int open_flags(const Config& c) {
   if (c.create_if_missing) {
     flags |= O_CREAT;
   }
-  if (c.truncate_existing) {
-    flags |= O_TRUNC;
-  }
   return flags | O_CLOEXEC;
 }
 int protection(const Config& c) {
@@ -39,6 +37,14 @@ int protection(const Config& c) {
 }
 int mapping_flags(const Config& c) {
   return c.sharing == Sharing::shared ? MAP_SHARED : MAP_PRIVATE;
+}
+void acquire_lock(int fd, LockMode mode) {
+  if (mode == LockMode::none) {
+    return;
+  }
+  const int operation =
+      (mode == LockMode::shared ? LOCK_SH : LOCK_EX) | LOCK_NB;
+  check_result(::flock(fd, operation), "flock");
 }
 int seek_whence(SeekWhence w) {
   switch (w) {
@@ -91,6 +97,10 @@ class MmapFile::Impl {
       throw_errno("open");
     }
     try {
+      acquire_lock(fd_, config_.locking);
+      if (config_.truncate_existing) {
+        check_result(::ftruncate(fd_, 0), "ftruncate");
+      }
       const file_offset size = checked_file_size();
       const std::size_t requested = initial_length_for_file(size);
       if (size < config_.offset || requested > available_length(size)) {
@@ -110,7 +120,9 @@ class MmapFile::Impl {
   }
 
   void close() {
-    require_open();
+    if (fd_ == -1) {
+      return;
+    }
     unmap_checked();
     (void)::close(std::exchange(fd_, -1));
   }
@@ -172,35 +184,46 @@ class MmapFile::Impl {
     require_writable();
     validate_resize_target(new_size);
     require_shared_growth();
+    require_variable_mapping_matches_file();
     const file_offset old_size = checked_file_size();
     const std::size_t new_length = length_for_file(new_size);
     if (new_size == old_size && new_length == length_) {
       return;
     }
     if (new_size < old_size) {
-      unmap_checked();
+      // The target range is contained in the current file, so it can be
+      // mapped before ftruncate(). This preserves the old mapping and file if
+      // allocating the replacement mapping or truncating the file fails.
+      void* replacement = map_new(new_length);
       try {
         check_result(::ftruncate(fd_, static_cast<off_t>(new_size)),
                      "ftruncate");
-        install(map_new(new_length), new_length);
       } catch (...) {
-        if (address_ == nullptr) {
-          try {
-            const auto old_length = length_for_file(old_size);
-            install(map_new(old_length), old_length);
-          } catch (...) {
-          }
+        if (replacement != nullptr) {
+          (void)::munmap(replacement, new_length);
         }
         throw;
       }
+      replace_mapping_with_prepared(replacement, new_length);
       return;
     }
     check_result(::ftruncate(fd_, static_cast<off_t>(new_size)), "ftruncate");
-    replace_mapping(new_length);
+    try {
+      replace_mapping(new_length);
+    } catch (...) {
+      // An exclusive advisory lock establishes the ownership needed to safely
+      // restore the old extent. Without that contract, preserve the actual
+      // file size and require remap() before another structural operation.
+      if (config_.locking == LockMode::exclusive) {
+        (void)::ftruncate(fd_, static_cast<off_t>(old_size));
+      }
+      throw;
+    }
   }
   void insert(std::span<const std::byte> source, std::size_t position) {
     require_writable();
     require_shared_growth();
+    require_variable_mapping_matches_file();
     check_range(position, 0);
     if (source.empty()) {
       return;
@@ -225,6 +248,15 @@ class MmapFile::Impl {
     std::memmove(mapped.data() + position + saved.size(),
                  mapped.data() + position, old_length - position);
     std::memcpy(mapped.data() + position, saved.data(), saved.size());
+  }
+  void remap() {
+    require_open();
+    const file_offset current_size = checked_file_size();
+    const std::size_t new_length = length_for_remap(current_size);
+    if (new_length == length_) {
+      return;
+    }
+    replace_mapping(new_length);
   }
   void sync(std::size_t p, std::size_t n, bool invalidate) {
     require_open();
@@ -274,6 +306,12 @@ class MmapFile::Impl {
           "copy-on-write data");
     }
   }
+  void require_variable_mapping_matches_file() const {
+    if (config_.length == 0 && checked_file_size() != mapping_end(length_)) {
+      throw std::logic_error(
+          "backing file size changed; call remap() before modifying it");
+    }
+  }
   void check_range(std::size_t p, std::size_t n) const {
     require_open();
     if (p > length_ || n > length_ - p) {
@@ -316,6 +354,13 @@ class MmapFile::Impl {
       throw std::invalid_argument("mmap offset is beyond the file");
     }
     return length_for_file(size);
+  }
+  [[nodiscard]] std::size_t length_for_remap(file_offset size) const {
+    const std::size_t available = available_length(size);
+    if (config_.length != 0 && config_.length > available) {
+      throw std::invalid_argument("mapping extends beyond the backing file");
+    }
+    return config_.length == 0 ? available : config_.length;
   }
   [[nodiscard]] off_t mapping_end(std::size_t length) const {
     const auto offset = static_cast<std::uintmax_t>(config_.offset);
@@ -375,6 +420,9 @@ class MmapFile::Impl {
   }
   void replace_mapping(std::size_t n) {
     void* replacement = map_new(n);
+    replace_mapping_with_prepared(replacement, n);
+  }
+  void replace_mapping_with_prepared(void* replacement, std::size_t n) {
     try {
       unmap_checked();
     } catch (...) {
@@ -484,6 +532,12 @@ void MmapFile::resize(file_offset n) {
     throw std::logic_error("mmap file is closed");
   }
   impl_->resize(n);
+}
+void MmapFile::remap() {
+  if (impl_ == nullptr) {
+    throw std::logic_error("mmap file is closed");
+  }
+  impl_->remap();
 }
 void MmapFile::sync(bool invalidate) {
   sync_range(0, mapping_length(), invalidate);
